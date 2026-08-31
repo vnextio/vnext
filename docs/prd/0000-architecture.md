@@ -1,12 +1,42 @@
 # PRD: vNext SaaS Control Plane
 
-Status: Draft v0.3
+Status: Draft v0.4
 Product Name: vNext
 GitHub Organization: `vnextio`
 Core Repository: `github.com/vnextio/vnext`
 Type: SaaS Control Plane / API Machinery
 Primary Reference Consumers: HR OS, Healthcare OS, Telry, Maritime SaaS, AI Agents / Call Center Platform
 Secondary / Conditional Consumers: Dental Equipment Marketplace, Insurance Core
+
+---
+
+## 0. Amendments & Precedence (v0.4)
+
+This document is the broad architecture narrative. Individual decisions are
+recorded as ADRs in [`../adr/`](../adr/). **When documents conflict, precedence is
+ADR > PRD > RFD.** RFD-0001 (`../rfd/0001-architecture-reference.md`) is
+**superseded** and historical only.
+
+v0.4 records the following decisions made after v0.3. Where a section below still
+reads in the old way, **the amendment here and the cited ADR win**; inline edits
+have been applied to the most load-bearing sections.
+
+| # | Decision | Supersedes / amends | ADR |
+| - | -------- | ------------------- | --- |
+| 1 | **`Project` is killed.** One deployment per product makes it a constant, not a model concept. Hierarchy is `platform → organization → scope`. `ProjectID` is removed from `RequestContext` and from all `control_plane.*` tables. `${PROJECT}` survives only as a deployment/namespace name (an ops label). | §9, §23.4 | ADR-0007 |
+| 2 | **Aggregating single API surface + unified discovery.** vNext is *the* API and discovery surface; consumers are backend-agnostic (`api-resources` model). Three serving mechanisms — built-in typed, registered dynamic (CRD-style), aggregated `vnext-service` — are indistinguishable to the client. | §22.4, §37.1 #5 | ADR-0006 |
+| 3 | **Dynamic types are a day-one architectural invariant** (discovery + client assume them); implementation of the generic store/proxy is phased after the core slice. | §37.1 #4 | ADR-0006 |
+| 4 | **Authentication is baked into the API server** (kube-apiserver model). `iss`-keyed central + per-tenant `AuthProvider`; validate `iss`+`aud`; unique `issuer`; verification local via cached JWKS. | §23.1, §23.3 | ADR-0004 (supersedes ADR-0002) |
+| 5 | **Delegation via TokenReview/SubjectAccessReview + front-proxy identity injection.** The bespoke signed-delegation envelope is dropped; token refresh is the client/BFF's job, never vNext's. | §23.3 | ADR-0004 |
+| 6 | **Strict-proxy reads** routed via discovery. Discovery cache always on; result cache **per-type opt-in** with TTL + `resource_events` invalidation; bounded pages. | §19 | ADR-0006 |
+| 7 | **Deploy strictly on Kubernetes.** Two planes: control-plane *data* in Postgres; *operational* plane (config, secrets, service discovery, leader election) is k8s-native (ConfigMap/Secret/Service/`Lease`). The Postgres `control_plane.leases` table is retired. vNext resources are **not** CRDs. | §15, §21.2 | ADR-0007 |
+| 8 | **Migrations are `vnext-service`-owned.** The control plane migrates only `control_plane.*`; each service self-migrates its own schema(s) on deploy with a schema-scoped DB role. No central orchestration; no cross-schema hard FKs. | §14, §35 | ADR-0007 |
+| 9 | **`vnext-service`** is the umbrella term for backends that serve types and/or run controllers (replaces "module / domain API server / controller"). | §22, §29 | ADR-0007 |
+| 10 | **Two reuse models, two layers** (see §5.7): platform = reused like a framework; domain = extended like k8s. Build vNext fresh, kernel as parts donor, strangler migration. | §3, §5, §35 | ADR-0005 |
+
+Earlier resolved/open decisions also covered by ADRs: RBAC inheritance via
+query-time ancestor check (ADR-0001); marketplace parked with the controller seam
+kept open (ADR-0003).
 
 ---
 
@@ -350,6 +380,43 @@ User ID
 
 These IDs are not secrets and must never replace authorization checks.
 
+### 5.7 Two Reuse Models, Two Layers
+
+vNext serves two intentions that pull in opposite directions, and it keeps them
+from colliding by assigning each to its own layer:
+
+```text
+Platform layer  → reused like a framework (Laravel-style): shared, batteries-
+                  included, stable. You get tenancy, RBAC, auth, audit,
+                  discovery, resource machinery, and the client SDK once; every
+                  product deploys an instance. Platform primitives are compiled
+                  into vNext.
+
+Domain layer    → extended like Kubernetes: register a type + run a
+                  vnext-service/controller. Domain logic is NEVER compiled into
+                  the control plane. Extending the platform requires no rebuild
+                  of the core.
+```
+
+The kernel failed because it applied framework-style reuse to **both** layers —
+domain modules were compiled into the framework binary, so "extend" meant
+"rebuild." That collision is the rebuild-on-new-module ceiling vNext exists to
+escape.
+
+The dividing rule, when unsure whether something is platform or domain:
+
+```text
+Would breaking it break EVERY vNext product?
+  yes -> platform primitive (compile into vNext)
+  no  -> domain extension (lives in a vnext-service)
+```
+
+For this to hold in practice, **building a `vnext-service` must be as ergonomic as
+a framework generator** (codegen from proto, a controller SDK, scaffolding, a
+`vnextctl` generator). Excellent `vnext-service` developer experience is a
+first-class goal, not late-phase polish — without it, teams take the shortcut of
+compiling domain logic in, and the ceiling returns. See ADR-0005.
+
 ---
 
 ## 6. Product Fit Decisions
@@ -496,8 +563,12 @@ vNext v1 will not:
 
 Core vNext concepts:
 
+> **`Project` was removed in v0.4 (ADR-0007).** One deployment per product makes
+> it a constant, not a model concept. The hierarchy root is the `platform`
+> tenant. `${PROJECT}` survives only as a deployment/namespace name (an ops
+> label), never as a resource or a stored column.
+
 ```text
-Project
 Tenant
 Scope
 Principal
@@ -680,6 +751,20 @@ Avoid `Account ID` for HR OS because it may confuse end-users.
 ### 11.2 Format
 
 Use Cloudflare-style opaque IDs.
+
+The ID payload is a random UUIDv4 generated and validated through a UUID library.
+
+Encoding rule:
+
+```text
+publicID = prefix + "_" + lowercase_dashless_uuid_v4
+```
+
+Example implementation rule:
+
+```text
+uuid.NewRandom() -> string -> remove "-" -> prefix
+```
 
 Recommended format:
 
@@ -1195,9 +1280,18 @@ control_plane.entitlement_snapshots
 control_plane.api_services
 control_plane.audit_events
 control_plane.resource_events
-control_plane.leases
 control_plane.outbox_events
 ```
+
+> **v0.4 amendments (ADR-0007):**
+> - `control_plane.leases` is **retired**. Controller leader election uses
+>   Kubernetes-native `coordination.k8s.io/Lease` (vNext deploys strictly on k8s).
+> - No `project_id` column on any `control_plane.*` table (`Project` is killed).
+> - `resource_events` and `outbox_events` are distinct by purpose:
+>   `resource_events` is the **watch/informer change feed** (the source for
+>   list/watch, §16) consumed internally; `outbox_events` is for **external event
+>   publishing** (e.g. NATS), optional and post-MVP. A single write may append to
+>   both within its transaction, but they are not the same table.
 
 `ResourceDefinition` storage is delayed until runtime/custom resources enter the implementation scope.
 
@@ -1207,9 +1301,49 @@ Storage identity mapping:
 id        -> metadata.uid
 name      -> metadata.name
 public_id -> metadata.publicID
+deleted_at -> metadata.deletionTimestamp
 ```
 
 For tenants, `kind` is a queryable storage copy of `spec.kind`.
+
+### 15.1 Soft Deletes
+
+Use soft deletes when the resource or domain row represents mutable business/control-plane state where auditability, support recovery, or delayed cleanup matters.
+
+Storage convention:
+
+```text
+deleted_at timestamptz null
+```
+
+API convention:
+
+```text
+metadata.deletionTimestamp
+```
+
+Domain modules that use GORM should use GORM's soft-delete convention for applicable mutable records, usually through `gorm.DeletedAt` or an equivalent `deleted_at` field.
+
+Soft-delete rules:
+
+1. Normal reads and lists exclude rows where `deleted_at is not null`.
+2. Raw SQL must explicitly filter `deleted_at is null` when it wants active rows.
+3. Resource events still emit a `DELETED` event so controller caches remove the object.
+4. The deleted row remains available for audit/debug, retention, restore, or later purge flows.
+5. Unique indexes must be chosen deliberately: full unique indexes if names must never be reused, or active-row partial/composite indexes if reuse after delete is allowed.
+
+Do not use soft deletes for append-only records whose correctness depends on immutability.
+
+Examples:
+
+```text
+audit_events
+resource_events
+outbox_events
+ledger entries
+usage facts
+high-volume immutable event streams
+```
 
 Example tenant table:
 
@@ -1228,7 +1362,8 @@ control_plane.tenants (
     generation bigint not null default 1,
     status text not null,
     created_at timestamptz not null,
-    updated_at timestamptz not null
+    updated_at timestamptz not null,
+    deleted_at timestamptz null
 );
 ```
 
@@ -1249,7 +1384,8 @@ control_plane.principals (
     generation bigint not null default 1,
     status text not null,
     created_at timestamptz not null,
-    updated_at timestamptz not null
+    updated_at timestamptz not null,
+    deleted_at timestamptz null
 );
 ```
 
@@ -1295,13 +1431,19 @@ control_plane.resource_events (
     group_name text not null,
     version text not null,
     kind text not null,
-    namespace text null,
+    org_tenant_id uuid null,
+    scope_tenant_id uuid null,
     name text not null,
     uid uuid not null,
     object jsonb null,
     created_at timestamptz not null
 );
 ```
+
+> **v0.4 amendment:** the original `namespace text null` column is removed. vNext
+> has **no Namespace concept** (§10); scope is carried by `org_tenant_id` /
+> `scope_tenant_id`, consistent with how domain resources are scoped. The
+> `namespace` term was a Kubernetes habit and does not apply here.
 
 Watch flow:
 
@@ -1484,11 +1626,11 @@ Deletion flow:
 
 ```text
 1. User deletes resource.
-2. vNext sets deletionTimestamp.
+2. If finalizers exist, vNext sets metadata.deletionTimestamp and keeps the resource visible to controllers.
 3. Controller sees resource is deleting.
 4. Controller cleans external state.
 5. Controller removes finalizer.
-6. vNext deletes the resource.
+6. vNext soft-deletes the resource by setting deleted_at, hides it from normal reads/lists, and emits a DELETED event.
 ```
 
 ---
@@ -1522,21 +1664,19 @@ controller name
 
 ### 21.2 Leases
 
-vNext should support leases for controller leader election.
+> **v0.4 amendment (ADR-0007):** vNext deploys strictly on Kubernetes, so
+> controller leader election uses Kubernetes-native `coordination.k8s.io/Lease`
+> and its battle-tested leader-election machinery. The previously proposed
+> `control_plane.leases` Postgres table is **retired** — there is no need to
+> hand-roll leases when the substrate provides them.
+>
+> This is part of the operational/control-plane split: *operational* concerns
+> (leader election, config, secrets, service discovery) are k8s-native;
+> *control-plane data* stays in Postgres.
 
-Example schema:
-
-```sql
-control_plane.leases (
-    name text primary key,
-    holder_identity text not null,
-    lease_duration_seconds int not null,
-    renew_time timestamptz not null,
-    resource_version bigint not null
-);
-```
-
-This is sufficient for v1 controller leader election. etcd is not required.
+A `vnext-service` that runs controllers participates in standard Kubernetes
+leader election so that only one replica reconciles at a time. No vNext-specific
+lease resource is exposed on the API.
 
 ---
 
@@ -1692,35 +1832,73 @@ Domain APIs must not invent incompatible envelopes or authorization shortcuts on
 
 Domain API compatibility should be enforced with shared contract packages, generated clients, middleware, and conformance tests.
 
-Recommended v1:
+Recommended approach:
+
+> **v0.4 amendment (ADR-0006, supersedes §37.1 #5).** The earlier "BFFs call
+> domain APIs directly" recommendation is **reversed**. vNext is the single
+> aggregating API surface; **consumers must not know which backend serves a
+> type** — they discover it the way `kubectl api-resources` does, and reach it
+> through one client. Direct-to-domain calls leak backend topology to clients and
+> are not used.
 
 ```text
-BFFs call domain APIs directly using generated clients.
-Domain APIs register themselves in vNext discovery.
+Clients use ONE vNext endpoint + ONE discovery surface.
+vNext aggregates: built-in typed | registered dynamic (CRD-style) | aggregated vnext-service.
+Aggregated types are proxied to their owning vnext-service (Model A),
+  with front-proxy identity injection (§23.3).
 ```
 
-Add vNext proxy/aggregation later if needed.
+Reads are strict-proxy through vNext, routed via the discovery cache; result
+caching is per-type opt-in with a TTL (ADR-0006). High-volume domain data still
+lives in `vnext-service`s (typed tables), never in the generic store (§5.4).
+Implementation of the generic store (dynamic types) and the proxy is phased after
+the core slice, but the discovery + client contract assumes them from day one.
 
 ---
 
 ## 23. Identity, Auth, and Delegation
 
-### 23.1 External Auth
+### 23.1 Baked-in Authentication
 
-vNext does not need to be the external identity provider.
+> **v0.4 amendment (ADR-0004, supersedes ADR-0002).** The earlier stance — "vNext
+> is not the external identity provider; BFFs verify tokens" — is **reversed**.
+> Because vNext is the single aggregating API surface (ADR-0006), authentication
+> must be a property of the API server itself, exactly as kube-apiserver
+> authenticates every request.
 
-Product BFFs may verify tokens from:
+vNext is **not** an identity provider (it does not issue end-user credentials or
+run login UIs), but it **does verify** the token presented on every request.
+
+**Authentication chain (first-to-accept wins):**
 
 ```text
-Keycloak
-Zitadel
-Firebase Auth
-Auth0
-Custom OIDC provider
-Product-specific auth provider
+1. ServiceAccount tokens  -> vNext-issued, vNext-signed JWTs (machine-to-machine)
+2. Central / platform OIDC -> one configured external provider (k8s --oidc-* analog)
+3. Per-tenant OIDC         -> each an AuthProvider resource (extension beyond vanilla k8s)
 ```
 
-The BFF normalizes external auth into vNext principal/membership context.
+vNext still verifies tokens from external providers such as Keycloak, Zitadel,
+Firebase Auth, Auth0, or any custom OIDC provider — the difference is that
+verification happens **in the API server**, not in each BFF.
+
+**Provider selection — by issuer (`iss`):**
+
+```text
+token.iss -> selects the AuthProvider whose JWKS verifies the signature
+assert: signature (cached JWKS), then iss, then aud, then exp
+```
+
+- `AuthProvider.spec.issuer` is **unique**; admission rejects a duplicate issuer.
+- `aud` must be validated, not just `iss`: `iss` selects the keys, `aud` proves
+  the token was minted for this deployment.
+- Verification is local once JWKS is cached — no network call on the hot path.
+
+A BFF (or any consumer) forwards the user's token to vNext; vNext authenticates it
+and resolves the principal/membership/tenant/roles context (§23.4). **Token
+refresh is the client/BFF's responsibility, never vNext's** — vNext holds no
+refresh tokens and no sessions; it only verifies the token presented per request.
+
+See `AuthProvider` (`iam/v1`) in §33.1 and ADR-0004 for the resource shape.
 
 ### 23.2 Service Accounts
 
@@ -1735,49 +1913,39 @@ operators
 CLIs
 ```
 
-### 23.3 Signed Delegation Context
+### 23.3 Delegation Across the Aggregation Boundary
 
-BFFs verify external user tokens, then call downstream services using:
+> **v0.4 amendment (ADR-0004).** The bespoke "BFF signs a short-lived delegation
+> token" model is **dropped**. It would layer a second TTL on top of provider
+> tokens with mismatched lifetimes and re-implements what Kubernetes already
+> provides natively. Two k8s-native mechanisms replace it.
 
-```text
-service identity
-signed delegation context
-```
+Because vNext authenticates every request (§23.1) and is the aggregating proxy
+(ADR-0006), an aggregated `vnext-service` does not re-authenticate end users:
 
-Downstream services trust only:
+**1. Front-proxy identity injection (primary).** vNext authenticates once, then
+forwards to the owning `vnext-service` with trusted identity headers (the
+Kubernetes `--requestheader-*` / `X-Remote-User` model) over a
+mutually-authenticated channel. The `vnext-service` trusts those headers **only**
+from vNext, never from arbitrary clients.
 
-```text
-verified service identity
-verified signed delegation context
-```
-
-They must not trust arbitrary client-provided headers.
-
-vNext's direct domain API model is closest in spirit to Kubernetes aggregation and impersonation controls:
-
-```text
-Only a verified, authorized service identity may delegate end-user context.
-Delegated identity is never accepted from arbitrary request headers.
-```
-
-Recommended v1 delegation format:
+**2. TokenReview / SubjectAccessReview (callback).** A `vnext-service` reached
+directly, or one that wants to verify independently, calls back to vNext's
+`TokenReview` / `SubjectAccessReview` endpoints. Same authority, opposite
+direction.
 
 ```text
-short-lived JWS/JWT-style signed delegation token
+Request flow (aggregated path):
+1. Client presents the user's token to vNext.
+2. vNext authenticates it (iss -> AuthProvider, validate iss+aud+exp+sig).
+3. vNext authorizes (RBAC, §24) and resolves principal/membership/tenant/roles.
+4. vNext proxies to the owning vnext-service with trusted identity headers.
+5. The vnext-service performs its own admission/business checks, then writes.
 ```
 
-Delegation flow:
-
-```text
-1. BFF verifies the external user token.
-2. BFF resolves principal, membership, tenant, scope, roles, permissions, and enabled features through vNext.
-3. BFF authenticates to the domain API as a vNext service account.
-4. BFF sends a signed delegation token with audience = target domain API.
-5. Domain API verifies service identity, signature, issuer, audience, expiry, request ID, and delegated authorization context.
-6. Domain API performs its own authorization/admission checks before writing domain state.
-```
-
-The signed context should be short-lived and scoped to the intended downstream audience.
+Downstream services trust only verified vNext front-proxy identity or a vNext
+`TokenReview`/`SAR` result — never arbitrary client-provided context headers.
+Authentication results may be cached with a short TTL bounded by token `exp`.
 
 ### 23.4 Request Context
 
@@ -1785,7 +1953,6 @@ Normalized request context:
 
 ```go
 type RequestContext struct {
-    ProjectID        string
     OrgTenantID      string
     ScopeTenantID    string
     ScopeKind        string
@@ -1798,6 +1965,12 @@ type RequestContext struct {
     EnabledFeatures  []string
 }
 ```
+
+> **v0.4 amendment (ADR-0007):** `ProjectID` is removed — `Project` is killed.
+> One deployment serves one product, so the project is an ambient deployment
+> constant, not a per-request field. The RFD-0001 `RequestContext` (with
+> `ProjectID`, `SecurityProfile`, `ModulesEnabled`) is superseded by this shape;
+> `ModulesEnabled` is covered by `EnabledFeatures`.
 
 Domain services should be testable with this context directly.
 
@@ -2333,21 +2506,30 @@ iam.v1.Role
 iam.v1.Permission
 iam.v1.RoleBinding
 iam.v1.ServiceAccount
+iam.v1.AuthProvider
 entitlements.v1.FeatureGrant
 entitlements.v1.Quota
 entitlements.v1.EntitlementSnapshot
 core.v1.AuditEvent
 apiregistration.vnext/v1.APIService
-coordination.vnext/v1.Lease
 ```
 
-Explicitly delayed from MVP:
+> **v0.4 amendments:**
+> - **`iam.v1.AuthProvider` added** (ADR-0004): authentication is baked in, so the
+>   provider config the authn chain needs is a first-party MVP resource.
+> - **`coordination.vnext/v1.Lease` removed** (ADR-0007): leader election uses
+>   Kubernetes-native `coordination.k8s.io/Lease`; vNext exposes no lease
+>   resource.
+
+Explicitly delayed from MVP (implementation only — the discovery/client contract
+assumes dynamic types from day one, per ADR-0006):
 
 ```text
 core.v1.ResourceDefinition
-runtime/custom resources
+runtime/custom resources (CRD-style generic storage)
 dynamic client
 generic resource table
+aggregation proxy to external vnext-services
 ```
 
 ### 33.2 Core MVP Services
@@ -2523,7 +2705,7 @@ Useful patterns to preserve:
 ```text
 module manifests
 module dependency graph
-migration orchestration
+migration tooling/ergonomics    (NOT central orchestration — see amendment)
 schema ownership
 tenant isolation ideas
 event bus abstraction
@@ -2531,6 +2713,20 @@ transactional outbox
 CLI patterns
 health/telemetry/bootstrap conventions
 ```
+
+> **v0.4 amendment (ADR-0007): migrations are `vnext-service`-owned.** Central
+> "migration orchestration" is **not** preserved — it reintroduces a deploy-time
+> coupling between the control plane and every domain service. Instead:
+> - The control plane migrates only `control_plane.*` (its own primitives).
+> - Each `vnext-service` owns and self-runs migrations for its own schema(s) on
+>   deploy (init container / k8s `Job`), with a **schema-scoped DB role** (DDL
+>   only on its own schema).
+> - **No cross-schema hard FKs** (§14.4 hardens to a rule): independent, unordered
+>   migrations mean no service may assume another's table exists.
+>
+> What *is* preserved is the migration *tooling/ergonomics*, packaged into the
+> `vnext-service` SDK so each service gets first-class migration DX **without** the
+> control plane running it.
 
 Patterns to avoid preserving as final architecture:
 
@@ -2650,15 +2846,28 @@ Apply vNext to:
 
 ### 37.1 Resolved Decisions
 
+> **Each decision below is now governed by an ADR; see §0 and [`../adr/`](../adr/).
+> Items 4, 5, and 9 were amended/superseded in v0.4.**
+
 1. Use one `Tenant` resource with hierarchy stored in `spec.kind`, instead of separate `Tenant` and `Scope` resource kinds.
 2. Use `metadata.publicID` for immutable opaque public IDs. `metadata.name` is the real resource name, and `metadata.uid` is the immutable internal system UID.
 3. Define first-party APIs using protobuf plus Buf. Generated JSON Schema is the primary REST/admission validation contract.
-4. Delay `ResourceDefinition`, dynamic clients, generic resource storage, and runtime/custom resources until typed core APIs are stable.
-5. v1 does not proxy/aggregate domain API servers. BFFs call domain APIs directly using generated clients, and domain APIs register in vNext discovery using `APIService`.
-6. Domain APIs must strictly follow the vNext platform API contract on `/apis/*`.
+4. *(Amended v0.4 — ADR-0006.)* The **implementation** of `ResourceDefinition`, dynamic clients, generic resource storage, and runtime/custom resources is phased after the core slice — but the discovery and client **contract** assumes dynamic types from day one. Dynamic types are a day-one architectural invariant, not a deferred afterthought.
+5. *(Superseded v0.4 — ADR-0006.)* vNext **does aggregate**. It is the single API surface and discovery surface; consumers are backend-agnostic and never call domain servers directly. Aggregated types are proxied to their owning `vnext-service`. (The original "BFFs call domain APIs directly" is reversed.)
+6. Domain APIs (`vnext-service`s) must strictly follow the vNext platform API contract on `/apis/*`.
 7. v1 watch support is `list + resourceVersion + durable resource_events polling`. Streaming watch and informer/cache semantics are later targets.
 8. Initial resource scoping is global for `Tenant`, `Principal`, `Role`, and `Permission`; organization or scope/branch scoped for `RoleBinding`, `FeatureGrant`, and `Quota`.
-9. Direct service-to-service delegation uses verified service identity plus a short-lived signed delegation context.
+9. *(Superseded v0.4 — ADR-0004.)* Delegation no longer uses a signed delegation envelope. vNext authenticates every request (baked-in authn chain); across the aggregation boundary it uses **front-proxy identity injection** plus **TokenReview/SubjectAccessReview**.
+
+Decisions added in v0.4 (each governed by an ADR; see §0):
+
+10. **Build vNext fresh**, kernel as parts donor, strangler migration (ADR-0005).
+11. **`Project` is killed**; hierarchy is `platform → organization → scope` (ADR-0007).
+12. **Authentication is baked into the API server**: `iss`-keyed central + per-tenant `AuthProvider`, validate `iss`+`aud`, unique issuer (ADR-0004, supersedes ADR-0002).
+13. **Aggregating single API surface + unified discovery**; strict-proxy reads with governed caching (ADR-0006).
+14. **Deploy strictly on Kubernetes**; control-plane *data* in Postgres, *operational* plane k8s-native; Postgres lease table retired (ADR-0007).
+15. **Migrations are `vnext-service`-owned**; control plane migrates only `control_plane.*`; schema-scoped DB roles; no cross-schema FKs (ADR-0007).
+16. **RBAC inheritance via query-time ancestor check** (ADR-0001); **marketplace parked**, controller seam kept open (ADR-0003).
 
 ### 37.2 Remaining Open Decisions
 
@@ -2669,7 +2878,9 @@ Apply vNext to:
 5. Should labels be implemented on every resource from day one or only on core resources first?
 6. Should localized display names be a field on all first-party resources or introduced resource by resource?
 7. Should each product have generated product-specific client bundles or consume separate vNext/domain clients?
-8. What are the exact scopes for `Membership`, `ServiceAccount`, `EntitlementSnapshot`, `APIService`, `AuditEvent`, `Event`, and `Lease`?
+8. What are the exact scopes for `Membership`, `ServiceAccount`, `EntitlementSnapshot`, `APIService`, `AuditEvent`, and `Event`? (`Lease` removed — k8s-native, ADR-0007.)
+
+> **v0.4 note:** items 1 and 8 **block the first implementation slice** — `pkg/publicid` cannot be rebuilt without the prefix catalog (1), and the schema + RBAC checks cannot be written strictly without the remaining scopes (8). Resolve these two first (each likely a short ADR). Items 2–7 do not block the core slice and can remain open.
 
 ---
 
